@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import random
@@ -19,17 +20,7 @@ log = logging.getLogger("razdacha")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])              # id чата, вида -100123...
 CHAT_LINK = os.environ.get("CHAT_LINK", "")       # публичная ссылка на чат (кнопка «Открыть чат»)
-def _ids(v):
-    return [x.strip() for x in v.replace("\n", ",").split(",") if x.strip()]
-
-
-# можно указать несколько id через запятую: бот выберет случайный
-GIFT_IDS = _ids(os.environ.get("GIFT_ID", ""))                    # подарки за друзей
-RAFFLE_GIFT_IDS = _ids(os.environ.get("RAFFLE_GIFT_ID", "")) or GIFT_IDS  # подарки в розыгрыше
-_emoji_cache = {}
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-SPONSOR = os.environ.get("SPONSOR", "@your_username")   # «от @...» в сообщении о выигрыше
-PROMO_TEXT = os.environ.get("PROMO_TEXT", "")           # рекламный блок под поздравлением (HTML)
+WIN_NOTE = os.environ.get("WIN_NOTE", "✅ Подарок отправлен.")  # строка под «Ты выиграл мишку»
 RAFFLE_EVERY = int(os.environ.get("RAFFLE_EVERY", "30"))
 FRIENDS_PER_GIFT = int(os.environ.get("FRIENDS_PER_GIFT", "5"))
 DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
@@ -185,16 +176,6 @@ async def upsert_user(u):
     await db.commit()
 
 
-async def gift_emoji(bot, gid):
-    if not _emoji_cache:
-        try:
-            for g in (await bot.get_available_gifts()).gifts:
-                _emoji_cache[g.id] = g.sticker.emoji or "🎁"
-        except Exception as e:
-            log.error("get_available_gifts failed: %s", e)
-    return _emoji_cache.get(gid, "🎁")
-
-
 # ---------- ЛИЧКА ----------
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(m: Message):
@@ -285,16 +266,6 @@ async def cb_top(call: CallbackQuery):
                               reply_markup=kb_menu())
 
 
-# ---------- АДМИН: узнать id подарков ----------
-@router.message(Command("gifts"), F.chat.type == ChatType.PRIVATE)
-async def cmd_gifts(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    gifts = await m.bot.get_available_gifts()
-    lines = [f"{g.sticker.emoji or ''} {g.star_count}⭐ — <code>{g.id}</code>" for g in gifts.gifts]
-    await m.answer("\n".join(lines[:60]) or "Пусто")
-
-
 # ---------- ЧАТ: вступление / выход ----------
 @router.chat_member(F.chat.id == CHAT_ID)
 async def on_member(ev: ChatMemberUpdated, bot: Bot):
@@ -322,26 +293,34 @@ async def on_member(ev: ChatMemberUpdated, bot: Bot):
 
 
 # ---------- ЧАТ: сообщения ----------
+async def notify_admin(bot: Bot, text):
+    if not ADMIN_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        log.error("admin notify failed: %s", e)
+
+
+def mention(uid, username, first_name):
+    name = html.escape(display(username, first_name, uid))
+    return f'<a href="tg://user?id={uid}">{name}</a> (id <code>{uid}</code>)'
+
+
 async def award(bot: Bot, inviter):
-    row = await q1("SELECT gifts_given FROM users WHERE id=?", (inviter,))
+    row = await q1("SELECT gifts_given, username, first_name FROM users WHERE id=?", (inviter,))
     if not row:
         return
-    given = row[0]
+    given, un, fn = row
     due = (await counted(inviter)) // FRIENDS_PER_GIFT - given
     for _ in range(max(0, due)):
-        try:
-            gid = random.choice(GIFT_IDS)
-            await bot.send_gift(user_id=inviter, gift_id=gid,
-                                text=f"Подарок за {FRIENDS_PER_GIFT} друзей!")
-        except Exception as e:
-            log.error("send_gift failed: %s", e)
-            if ADMIN_ID:
-                await bot.send_message(ADMIN_ID, f"⚠️ Не смог отправить подарок {inviter}: {e}")
-            return
+        given += 1
         await db.execute("UPDATE users SET gifts_given=gifts_given+1 WHERE id=?", (inviter,))
         await db.commit()
+        await notify_admin(bot, f"🎁 Подарок за друзей: {mention(inviter, un, fn)} — подарок №{given}. Отправь вручную.")
         try:
-            await bot.send_message(inviter, f"🎁 <b>Тебе прилетел подарок!</b> {await gift_emoji(bot, gid)}\nСпасибо, что зовёшь друзей!")
+            await bot.send_message(inviter, f"🎁 <b>Ты пригласил {FRIENDS_PER_GIFT} друзей!</b> 🧸\n"
+                                            "Подарок скоро прилетит. Спасибо, что зовёшь друзей!")
         except Exception:
             pass
 
@@ -353,16 +332,14 @@ async def run_raffle(bot: Bot):
     await db.execute("UPDATE meta SET v=0 WHERE k='cnt'")
     await db.commit()
     try:
-        gid = random.choice(RAFFLE_GIFT_IDS)
-        await bot.send_gift(user_id=uid, gift_id=gid, text="Приз из раздачи!")
-    except Exception as e:
-        log.error("raffle gift failed: %s", e)
-        if ADMIN_ID:
-            await bot.send_message(ADMIN_ID, f"⚠️ Розыгрыш: не смог отправить подарок {uid}: {e}")
-        return
+        u = (await bot.get_chat_member(CHAT_ID, uid)).user
+        who = mention(uid, u.username, u.first_name)
+    except Exception:
+        who = f"id <code>{uid}</code>"
+    await notify_admin(bot, f"🎉 Победитель розыгрыша: {who}. Отправь подарок вручную.")
     text = (f"🎉 <b>Поздравляю!</b>\n"
-            f"📨 Ты выиграл подарок {await gift_emoji(bot, gid)} от {SPONSOR}\n"
-            f"✅ Подарок отправлен.")
+            f"📨 Ты выиграл мишку 🧸 от {SPONSOR}\n"
+            f"{WIN_NOTE}")
     if PROMO_TEXT:
         text += f"\n\n{PROMO_TEXT}"
     await bot.send_message(CHAT_ID, text, reply_to_message_id=msg_id,
