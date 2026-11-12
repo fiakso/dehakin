@@ -352,8 +352,24 @@ async def cmd_id(m: Message):
     await m.reply(f"id этого чата: <code>{m.chat.id}</code>\n{ok}")
 
 
+@router.message(Command("count"))
+async def cmd_count(m: Message):
+    r = await q1("SELECT v FROM meta WHERE k='cnt'")
+    n = r[0] if r else 0
+    await m.reply(f"Счётчик розыгрыша: {n} из {RAFFLE_EVERY}\n"
+                  f"Чат совпадает с CHAT_ID: {'да' if m.chat.id == CHAT_ID else 'нет'}")
+
+
 @router.message(F.chat.id == CHAT_ID, F.from_user, ~F.from_user.is_bot)
 async def on_chat_message(m: Message, bot: Bot):
+    try:
+        await handle_chat_message(m, bot)
+    except Exception as e:
+        log.exception("chat message handler failed")
+        await notify_admin(bot, f"⚠️ Ошибка бота: <code>{html.escape(repr(e))}</code>")
+
+
+async def handle_chat_message(m: Message, bot: Bot):
     uid = m.from_user.id
     # засчёт реферала: первое сообщение приглашённого
     cur = await db.execute("UPDATE refs SET messaged=1 WHERE invited_id=? AND messaged=0 AND in_chat=1", (uid,))
