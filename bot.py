@@ -346,6 +346,12 @@ async def run_raffle(bot: Bot):
                            allow_sending_without_reply=True)
 
 
+@router.message(Command("id"))
+async def cmd_id(m: Message):
+    ok = "✅ совпадает с CHAT_ID" if m.chat.id == CHAT_ID else f"❌ НЕ совпадает с CHAT_ID ({CHAT_ID})"
+    await m.reply(f"id этого чата: <code>{m.chat.id}</code>\n{ok}")
+
+
 @router.message(F.chat.id == CHAT_ID, F.from_user, ~F.from_user.is_bot)
 async def on_chat_message(m: Message, bot: Bot):
     uid = m.from_user.id
