@@ -19,8 +19,14 @@ log = logging.getLogger("razdacha")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])              # id чата, вида -100123...
 CHAT_LINK = os.environ.get("CHAT_LINK", "")       # публичная ссылка на чат (кнопка «Открыть чат»)
-GIFT_ID = os.environ.get("GIFT_ID", "")           # id подарка (мишка) за 5 друзей
-RAFFLE_GIFT_ID = os.environ.get("RAFFLE_GIFT_ID", GIFT_ID)
+def _ids(v):
+    return [x.strip() for x in v.replace("\n", ",").split(",") if x.strip()]
+
+
+# можно указать несколько id через запятую: бот выберет случайный
+GIFT_IDS = _ids(os.environ.get("GIFT_ID", ""))                    # подарки за друзей
+RAFFLE_GIFT_IDS = _ids(os.environ.get("RAFFLE_GIFT_ID", "")) or GIFT_IDS  # подарки в розыгрыше
+_emoji_cache = {}
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 SPONSOR = os.environ.get("SPONSOR", "@your_username")   # «от @...» в сообщении о выигрыше
 PROMO_TEXT = os.environ.get("PROMO_TEXT", "")           # рекламный блок под поздравлением (HTML)
@@ -179,6 +185,16 @@ async def upsert_user(u):
     await db.commit()
 
 
+async def gift_emoji(bot, gid):
+    if not _emoji_cache:
+        try:
+            for g in (await bot.get_available_gifts()).gifts:
+                _emoji_cache[g.id] = g.sticker.emoji or "🎁"
+        except Exception as e:
+            log.error("get_available_gifts failed: %s", e)
+    return _emoji_cache.get(gid, "🎁")
+
+
 # ---------- ЛИЧКА ----------
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(m: Message):
@@ -314,7 +330,8 @@ async def award(bot: Bot, inviter):
     due = (await counted(inviter)) // FRIENDS_PER_GIFT - given
     for _ in range(max(0, due)):
         try:
-            await bot.send_gift(user_id=inviter, gift_id=GIFT_ID,
+            gid = random.choice(GIFT_IDS)
+            await bot.send_gift(user_id=inviter, gift_id=gid,
                                 text=f"Подарок за {FRIENDS_PER_GIFT} друзей!")
         except Exception as e:
             log.error("send_gift failed: %s", e)
@@ -324,7 +341,7 @@ async def award(bot: Bot, inviter):
         await db.execute("UPDATE users SET gifts_given=gifts_given+1 WHERE id=?", (inviter,))
         await db.commit()
         try:
-            await bot.send_message(inviter, "🎁 <b>Тебе прилетел подарок!</b> 🧸\nСпасибо, что зовёшь друзей!")
+            await bot.send_message(inviter, f"🎁 <b>Тебе прилетел подарок!</b> {await gift_emoji(bot, gid)}\nСпасибо, что зовёшь друзей!")
         except Exception:
             pass
 
@@ -336,14 +353,15 @@ async def run_raffle(bot: Bot):
     await db.execute("UPDATE meta SET v=0 WHERE k='cnt'")
     await db.commit()
     try:
-        await bot.send_gift(user_id=uid, gift_id=RAFFLE_GIFT_ID, text="Приз из раздачи!")
+        gid = random.choice(RAFFLE_GIFT_IDS)
+        await bot.send_gift(user_id=uid, gift_id=gid, text="Приз из раздачи!")
     except Exception as e:
         log.error("raffle gift failed: %s", e)
         if ADMIN_ID:
             await bot.send_message(ADMIN_ID, f"⚠️ Розыгрыш: не смог отправить подарок {uid}: {e}")
         return
     text = (f"🎉 <b>Поздравляю!</b>\n"
-            f"📨 Ты выиграл мишку 🧸 от {SPONSOR}\n"
+            f"📨 Ты выиграл подарок {await gift_emoji(bot, gid)} от {SPONSOR}\n"
             f"✅ Подарок отправлен.")
     if PROMO_TEXT:
         text += f"\n\n{PROMO_TEXT}"
