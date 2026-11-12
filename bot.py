@@ -21,7 +21,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])              # id чата, вида -100123...
 CHAT_LINK = os.environ.get("CHAT_LINK", "")       # публичная ссылка на чат (кнопка «Открыть чат»)
 WIN_NOTE = os.environ.get("WIN_NOTE", "✅ Подарок отправлен.")  # строка под «Ты выиграл мишку»
-RAFFLE_EVERY = int(os.environ.get("RAFFLE_EVERY", "30"))
+RAFFLE_EVERY = int(os.environ.get("RAFFLE_EVERY", "50"))
 FRIENDS_PER_GIFT = int(os.environ.get("FRIENDS_PER_GIFT", "5"))
 DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
 
