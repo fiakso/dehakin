@@ -360,6 +360,22 @@ async def cmd_count(m: Message):
                   f"Чат совпадает с CHAT_ID: {'да' if m.chat.id == CHAT_ID else 'нет'}")
 
 
+@router.message(Command("raffle"))
+async def cmd_raffle(m: Message, bot: Bot):
+    if m.from_user.id != ADMIN_ID:
+        await m.reply(f"Команда только для админа. Твой id: <code>{m.from_user.id}</code>, "
+                      f"ADMIN_ID в Railway: <code>{ADMIN_ID}</code>")
+        return
+    async with raffle_lock:
+        await db.execute("INSERT INTO recent(user_id,msg_id) VALUES(?,?)", (m.from_user.id, m.message_id))
+        await db.commit()
+        try:
+            await run_raffle(bot)
+        except Exception as e:
+            log.exception("raffle test failed")
+            await m.reply(f"⚠️ Ошибка розыгрыша: <code>{html.escape(repr(e))}</code>")
+
+
 @router.message(F.chat.id == CHAT_ID, F.from_user, ~F.from_user.is_bot)
 async def on_chat_message(m: Message, bot: Bot):
     try:
