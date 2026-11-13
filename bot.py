@@ -1,40 +1,81 @@
+"""раздача от депчика — бот розыгрышей и рефералки для чата. Версия 8."""
 import asyncio
 import html
 import logging
 import os
 import random
+import sys
 from urllib.parse import quote
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
+from aiogram.enums import ChatMemberStatus, ChatType, ContentType, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (CallbackQuery, ChatMemberUpdated,
-                           InlineKeyboardButton, InlineKeyboardMarkup, Message)
+from aiogram.types import (CallbackQuery, ChatMemberUpdated, ErrorEvent,
+                           InlineKeyboardButton, InlineKeyboardMarkup, Message,
+                           ReplyParameters)
 
-logging.basicConfig(level=logging.INFO)
+VERSION = "v8"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("razdacha")
 
-# ---------- КОНФИГ (всё через переменные окружения) ----------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = int(os.environ["CHAT_ID"])              # id чата, вида -100123...
-CHAT_LINK = os.environ.get("CHAT_LINK", "")       # публичная ссылка на чат (кнопка «Открыть чат»)
-WIN_NOTE = os.environ.get("WIN_NOTE", "✅ Подарок отправлен.")  # строка под «Ты выиграл мишку»
-RAFFLE_EVERY = int(os.environ.get("RAFFLE_EVERY", "50"))
-FRIENDS_PER_GIFT = int(os.environ.get("FRIENDS_PER_GIFT", "5"))
-DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
+
+# ---------------- КОНФИГ ----------------
+def env(name, default=""):
+    return os.environ.get(name, default).strip()
+
+
+def env_int(name, default=0):
+    raw = env(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.error("Переменная %s должна быть числом, а там: %r. Беру %s", name, raw, default)
+        return default
+
+
+BOT_TOKEN = env("BOT_TOKEN")
+CHAT_ID = env_int("CHAT_ID")
+CHAT_LINK = env("CHAT_LINK")
+ADMIN_ID = env_int("ADMIN_ID")
+SPONSOR = env("SPONSOR", "@your_username")
+PROMO_TEXT = env("PROMO_TEXT")
+WIN_NOTE = env("WIN_NOTE", "✅ Подарок отправлен.")
+RAFFLE_EVERY = max(1, env_int("RAFFLE_EVERY", 50))
+FRIENDS_PER_GIFT = max(1, env_int("FRIENDS_PER_GIFT", 5))
+DB_PATH = env("DB_PATH", "/data/bot.db")
+
+missing = [n for n, v in (("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID)) if not v]
+if missing:
+    log.error("НЕ ЗАДАНЫ ПЕРЕМЕННЫЕ: %s. Добавь их в Railway -> Variables.", ", ".join(missing))
+    sys.exit(1)
+
+ANON_ADMIN_ID = 1087968824  # «анонимный админ» Telegram
+COUNTED_TYPES = {
+    ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO, ContentType.STICKER,
+    ContentType.VOICE, ContentType.VIDEO_NOTE, ContentType.ANIMATION,
+    ContentType.AUDIO, ContentType.DOCUMENT,
+}
 
 router = Router()
 db: aiosqlite.Connection
 raffle_lock = asyncio.Lock()
 
 
-# ---------- БАЗА ----------
+# ---------------- БАЗА ----------------
 async def init_db():
     global db
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    db = await aiosqlite.connect(DB_PATH)
+    path = DB_PATH
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        db = await aiosqlite.connect(path)
+    except Exception as e:
+        log.warning("Не могу открыть базу %s (%s). Использую ./bot.db — после перезапуска данные пропадут. "
+                    "Добавь Volume с путём /data.", path, e)
+        db = await aiosqlite.connect("bot.db")
     await db.executescript(
         """
         CREATE TABLE IF NOT EXISTS users(
@@ -61,10 +102,16 @@ async def qa(sql, args=()):
     return await cur.fetchall()
 
 
+def esc(x):
+    return html.escape(str(x))
+
+
 def display(username, first_name, uid):
-    if username:
-        return f"@{username}"
-    return first_name or str(uid)
+    return f"@{username}" if username else (first_name or str(uid))
+
+
+def mention(uid, username, first_name):
+    return f'<a href="tg://user?id={uid}">{esc(display(username, first_name, uid))}</a> (id <code>{uid}</code>)'
 
 
 async def counted(uid):
@@ -72,7 +119,22 @@ async def counted(uid):
     return r[0]
 
 
-# ---------- ТЕКСТЫ ----------
+async def get_counter():
+    r = await q1("SELECT v FROM meta WHERE k='cnt'")
+    return r[0] if r else 0
+
+
+async def notify_admin(bot: Bot, text):
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID не задан, уведомление не отправлено: %s", text)
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        log.error("Не смог написать админу (нажми /start у бота в личке): %s", e)
+
+
+# ---------------- ТЕКСТЫ ----------------
 LINE = "━━━━━━━━━━━━━━━━━━"
 
 
@@ -81,7 +143,7 @@ def box(title):
 
 
 def start_text(name):
-    return f"👋 <b>Привет, {name}!</b>\n\n👥 <b>Приглашения — подарок за друзей</b>"
+    return f"👋 <b>Привет, {esc(name)}!</b>\n\n👥 <b>Приглашения — подарок за друзей</b>"
 
 
 def how_text():
@@ -107,11 +169,10 @@ async def panel_text(uid, name, link):
     prog = c % FRIENDS_PER_GIFT
     filled = round(prog / FRIENDS_PER_GIFT * 10)
     bar = "▓" * filled + "░" * (10 - filled)
-    left = FRIENDS_PER_GIFT - prog
     target = (f"Первый подарок — за {FRIENDS_PER_GIFT} друзей" if gifts == 0 and c == 0
-              else f"Следующий подарок — ещё {left} друзей")
+              else f"Следующий подарок — ещё {FRIENDS_PER_GIFT - prog} друзей")
     return (
-        f"{LINE}\n👋 <b>Привет, {name}!</b>\n{LINE}\n\n"
+        f"{LINE}\n👋 <b>Привет, {esc(name)}!</b>\n{LINE}\n\n"
         "👥 Приглашай друзей в чат!\n\n"
         f"За каждые {FRIENDS_PER_GIFT} друзей — подарок 🧸\n\n"
         "Друг должен перейти по твоей ссылке и остаться в чате.\n\n"
@@ -131,7 +192,7 @@ async def panel_text(uid, name, link):
     )
 
 
-# ---------- КЛАВИАТУРЫ ----------
+# ---------------- КЛАВИАТУРЫ ----------------
 def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пригласить друзей", callback_data="panel")]])
@@ -140,7 +201,7 @@ def kb_start():
 def kb_panel(link):
     share = f"https://t.me/share/url?url={quote(link)}&text={quote('Залетай в чат, тут раздают мишек 🧸')}"
     rows = [[InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)]]
-    if CHAT_LINK:
+    if CHAT_LINK.startswith("http"):
         rows.append([InlineKeyboardButton(text="🔗 Открыть чат", url=CHAT_LINK)])
     rows += [
         [InlineKeyboardButton(text="👥 Мои друзья", callback_data="friends"),
@@ -157,7 +218,15 @@ def kb_menu():
         [InlineKeyboardButton(text="◀️ В меню", callback_data="panel")]])
 
 
-# ---------- ССЫЛКИ ----------
+# ---------------- ЛИЧКА ----------------
+async def upsert_user(u):
+    await db.execute(
+        "INSERT INTO users(id,username,first_name) VALUES(?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
+        (u.id, u.username, u.first_name))
+    await db.commit()
+
+
 async def get_link(bot: Bot, uid):
     r = await q1("SELECT link FROM users WHERE id=?", (uid,))
     if r and r[0]:
@@ -168,15 +237,6 @@ async def get_link(bot: Bot, uid):
     return inv.invite_link
 
 
-async def upsert_user(u):
-    await db.execute(
-        "INSERT INTO users(id,username,first_name) VALUES(?,?,?) "
-        "ON CONFLICT(id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
-        (u.id, u.username, u.first_name))
-    await db.commit()
-
-
-# ---------- ЛИЧКА ----------
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(m: Message):
     await upsert_user(m.from_user)
@@ -186,16 +246,22 @@ async def cmd_start(m: Message):
 async def send_panel(call: CallbackQuery, edit=False):
     u = call.from_user
     await upsert_user(u)
-    link = await get_link(call.bot, u.id)
+    try:
+        link = await get_link(call.bot, u.id)
+    except Exception as e:
+        log.error("Не смог создать ссылку: %s", e)
+        await call.message.answer("😕 Не получилось создать ссылку. Попробуй позже.")
+        await notify_admin(call.bot, "⚠️ Не могу создать пригласительную ссылку. Бот должен быть АДМИНОМ чата "
+                                     f"с правом «Приглашать пользователей».\n<code>{esc(e)}</code>")
+        return
     text = await panel_text(u.id, u.first_name, link)
-    kb = kb_panel(link)
     if edit:
         try:
-            await call.message.edit_text(text, reply_markup=kb)
+            await call.message.edit_text(text, reply_markup=kb_panel(link))
         except Exception:
             pass
     else:
-        await call.message.answer(text, reply_markup=kb)
+        await call.message.answer(text, reply_markup=kb_panel(link))
 
 
 @router.callback_query(F.data == "panel")
@@ -225,20 +291,19 @@ async def cb_how(call: CallbackQuery):
 @router.callback_query(F.data == "friends")
 async def cb_friends(call: CallbackQuery):
     await call.answer()
-    rows = await qa("SELECT invited_id, invited_name, messaged, in_chat FROM refs WHERE inviter_id=?",
-                    (call.from_user.id,))
+    rows = await qa("SELECT invited_name, messaged, in_chat FROM refs WHERE inviter_id=?", (call.from_user.id,))
     if not rows:
         text = ("👥 <b>Мои друзья</b>\n\nОтправь свою ссылку друзьям — "
                 "как только кто-то зайдёт по ней, он появится здесь.")
     else:
         lines = []
-        for _, name, msg, inchat in rows:
+        for name, msg, inchat in rows:
             if not inchat:
-                lines.append(f"🚪 {name} — вышел(ла)")
+                lines.append(f"🚪 {esc(name)} — вышел(ла)")
             elif msg:
-                lines.append(f"✅ {name} — засчитан")
+                lines.append(f"✅ {esc(name)} — засчитан")
             else:
-                lines.append(f"⏳ {name} — ещё не писал(а)")
+                lines.append(f"⏳ {esc(name)} — ещё не писал(а)")
         c = await counted(call.from_user.id)
         text = f"👥 <b>Мои друзья</b> ({c} засчитано)\n\n" + "\n".join(lines)
     await call.message.answer(text, reply_markup=kb_menu())
@@ -252,21 +317,48 @@ async def cb_top(call: CallbackQuery):
         "LEFT JOIN users u ON u.id=r.inviter_id WHERE r.messaged=1 AND r.in_chat=1 "
         "GROUP BY r.inviter_id ORDER BY c DESC LIMIT 10")
     medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    ids = []
+    lines, ids = [], []
     for i, (uid, c, un, fn) in enumerate(rows):
         ids.append(uid)
         mark = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{mark} {display(un, fn, uid)} — {c} 👥")
+        lines.append(f"{mark} {esc(display(un, fn, uid))} — {c} 👥")
     me = await counted(call.from_user.id)
     tail = (f"Ты: {me} 👥 — ты в топе! 🔥" if call.from_user.id in ids
             else f"Ты: {me} 👥 — до топа ещё чуть-чуть!")
     body = "\n".join(lines) if lines else "Пока никого — будь первым!"
-    await call.message.answer(f"🏆 <b>Топ приглашающих</b>\n\n{body}\n\n<i>{tail}</i>",
-                              reply_markup=kb_menu())
+    await call.message.answer(f"🏆 <b>Топ приглашающих</b>\n\n{body}\n\n<i>{tail}</i>", reply_markup=kb_menu())
 
 
-# ---------- ЧАТ: вступление / выход ----------
+# ---------------- ДИАГНОСТИКА ----------------
+@router.message(Command("id"))
+async def cmd_id(m: Message):
+    ok = "✅ совпадает с CHAT_ID" if m.chat.id == CHAT_ID else f"❌ НЕ совпадает с CHAT_ID ({CHAT_ID})"
+    await m.reply(f"id этого чата: <code>{m.chat.id}</code>\n{ok}\nтвой id: <code>{m.from_user.id}</code>")
+
+
+@router.message(Command("count"))
+async def cmd_count(m: Message):
+    await m.reply(f"Счётчик розыгрыша: {await get_counter()} из {RAFFLE_EVERY}\n"
+                  f"Версия бота: {VERSION}")
+
+
+@router.message(Command("raffle"))
+async def cmd_raffle(m: Message, bot: Bot):
+    if m.from_user.id != ADMIN_ID:
+        await m.reply(f"Команда только для админа. Твой id: <code>{m.from_user.id}</code>, "
+                      f"ADMIN_ID в Railway: <code>{ADMIN_ID}</code>")
+        return
+    async with raffle_lock:
+        await db.execute("INSERT INTO recent(user_id,msg_id) VALUES(?,?)", (m.from_user.id, m.message_id))
+        await db.commit()
+        try:
+            await run_raffle(bot)
+        except Exception as e:
+            log.exception("тест розыгрыша")
+            await m.reply(f"⚠️ Ошибка розыгрыша: <code>{esc(repr(e))}</code>")
+
+
+# ---------------- ЧАТ ----------------
 @router.chat_member(F.chat.id == CHAT_ID)
 async def on_member(ev: ChatMemberUpdated, bot: Bot):
     u = ev.new_chat_member.user
@@ -282,29 +374,14 @@ async def on_member(ev: ChatMemberUpdated, bot: Bot):
                 return
             if inviter == u.id:
                 return
-            name = display(u.username, u.first_name, u.id)
             await db.execute("INSERT OR IGNORE INTO refs(invited_id,inviter_id,invited_name) VALUES(?,?,?)",
-                             (u.id, inviter, name))
-            await db.execute("UPDATE refs SET in_chat=1 WHERE invited_id=? AND inviter_id=?", (u.id, inviter))
+                             (u.id, inviter, display(u.username, u.first_name, u.id)))
+            await db.execute("UPDATE refs SET in_chat=1 WHERE invited_id=?", (u.id,))
             await db.commit()
+            log.info("Новый реферал %s от %s", u.id, inviter)
     elif st in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
         await db.execute("UPDATE refs SET in_chat=0 WHERE invited_id=?", (u.id,))
         await db.commit()
-
-
-# ---------- ЧАТ: сообщения ----------
-async def notify_admin(bot: Bot, text):
-    if not ADMIN_ID:
-        return
-    try:
-        await bot.send_message(ADMIN_ID, text)
-    except Exception as e:
-        log.error("admin notify failed: %s", e)
-
-
-def mention(uid, username, first_name):
-    name = html.escape(display(username, first_name, uid))
-    return f'<a href="tg://user?id={uid}">{name}</a> (id <code>{uid}</code>)'
 
 
 async def award(bot: Bot, inviter):
@@ -317,7 +394,7 @@ async def award(bot: Bot, inviter):
         given += 1
         await db.execute("UPDATE users SET gifts_given=gifts_given+1 WHERE id=?", (inviter,))
         await db.commit()
-        await notify_admin(bot, f"🎁 Подарок за друзей: {mention(inviter, un, fn)} — подарок №{given}. Отправь вручную.")
+        await notify_admin(bot, f"🎁 За друзей: {mention(inviter, un, fn)} — подарок №{given}. Отправь вручную.")
         try:
             await bot.send_message(inviter, f"🎁 <b>Ты пригласил {FRIENDS_PER_GIFT} друзей!</b> 🧸\n"
                                             "Подарок скоро прилетит. Спасибо, что зовёшь друзей!")
@@ -327,9 +404,11 @@ async def award(bot: Bot, inviter):
 
 async def run_raffle(bot: Bot):
     rows = await qa("SELECT user_id, msg_id FROM recent")
-    uid, msg_id = random.choice(rows)  # чем больше сообщений — тем выше шанс
+    if not rows:
+        return
+    uid, msg_id = random.choice(rows)  # больше сообщений — выше шанс
     await db.execute("DELETE FROM recent")
-    await db.execute("UPDATE meta SET v=0 WHERE k='cnt'")
+    await db.execute("INSERT INTO meta(k,v) VALUES('cnt',0) ON CONFLICT(k) DO UPDATE SET v=0")
     await db.commit()
     try:
         u = (await bot.get_chat_member(CHAT_ID, uid)).user
@@ -338,78 +417,64 @@ async def run_raffle(bot: Bot):
         who = f"id <code>{uid}</code>"
     await notify_admin(bot, f"🎉 Победитель розыгрыша: {who}. Отправь подарок вручную.")
     text = (f"🎉 <b>Поздравляю!</b>\n"
-            f"📨 Ты выиграл мишку 🧸 от {SPONSOR}\n"
-            f"{WIN_NOTE}")
+            f"📨 Ты выиграл мишку 🧸 от {esc(SPONSOR)}\n"
+            f"{esc(WIN_NOTE)}")
     if PROMO_TEXT:
         text += f"\n\n{PROMO_TEXT}"
-    await bot.send_message(CHAT_ID, text, reply_to_message_id=msg_id,
-                           allow_sending_without_reply=True)
-
-
-@router.message(Command("id"))
-async def cmd_id(m: Message):
-    ok = "✅ совпадает с CHAT_ID" if m.chat.id == CHAT_ID else f"❌ НЕ совпадает с CHAT_ID ({CHAT_ID})"
-    await m.reply(f"id этого чата: <code>{m.chat.id}</code>\n{ok}")
-
-
-@router.message(Command("count"))
-async def cmd_count(m: Message):
-    r = await q1("SELECT v FROM meta WHERE k='cnt'")
-    n = r[0] if r else 0
-    await m.reply(f"Счётчик розыгрыша: {n} из {RAFFLE_EVERY}\n"
-                  f"Чат совпадает с CHAT_ID: {'да' if m.chat.id == CHAT_ID else 'нет'}")
-
-
-@router.message(Command("raffle"))
-async def cmd_raffle(m: Message, bot: Bot):
-    if m.from_user.id != ADMIN_ID:
-        await m.reply(f"Команда только для админа. Твой id: <code>{m.from_user.id}</code>, "
-                      f"ADMIN_ID в Railway: <code>{ADMIN_ID}</code>")
-        return
-    async with raffle_lock:
-        await db.execute("INSERT INTO recent(user_id,msg_id) VALUES(?,?)", (m.from_user.id, m.message_id))
-        await db.commit()
-        try:
-            await run_raffle(bot)
-        except Exception as e:
-            log.exception("raffle test failed")
-            await m.reply(f"⚠️ Ошибка розыгрыша: <code>{html.escape(repr(e))}</code>")
-
-
-@router.message(F.chat.id == CHAT_ID, F.from_user, ~F.from_user.is_bot)
-async def on_chat_message(m: Message, bot: Bot):
     try:
-        await handle_chat_message(m, bot)
-    except Exception as e:
-        log.exception("chat message handler failed")
-        await notify_admin(bot, f"⚠️ Ошибка бота: <code>{html.escape(repr(e))}</code>")
+        await bot.send_message(CHAT_ID, text,
+                               reply_parameters=ReplyParameters(message_id=msg_id,
+                                                                allow_sending_without_reply=True))
+    except Exception as e1:
+        log.error("Поздравление с ответом не ушло: %s. Пробую без ответа и без разметки", e1)
+        try:
+            await bot.send_message(CHAT_ID, f"🎉 Поздравляю! Ты выиграл мишку 🧸 от {SPONSOR}",
+                                   parse_mode=None)
+        except Exception as e2:
+            await notify_admin(bot, f"⚠️ Не могу написать в чат: <code>{esc(e2)}</code>")
+            raise
 
 
-async def handle_chat_message(m: Message, bot: Bot):
+@router.message(F.chat.id == CHAT_ID)
+async def on_chat_message(m: Message, bot: Bot):
+    if m.content_type not in COUNTED_TYPES:
+        return
+    if not m.from_user or m.from_user.is_bot or m.from_user.id == ANON_ADMIN_ID or m.sender_chat:
+        return
     uid = m.from_user.id
-    # засчёт реферала: первое сообщение приглашённого
     cur = await db.execute("UPDATE refs SET messaged=1 WHERE invited_id=? AND messaged=0 AND in_chat=1", (uid,))
     await db.commit()
     if cur.rowcount:
         r = await q1("SELECT inviter_id FROM refs WHERE invited_id=?", (uid,))
         if r:
             await award(bot, r[0])
-    # счётчик розыгрыша
     async with raffle_lock:
         await db.execute("INSERT INTO recent(user_id,msg_id) VALUES(?,?)", (uid, m.message_id))
         await db.execute("INSERT INTO meta(k,v) VALUES('cnt',1) ON CONFLICT(k) DO UPDATE SET v=v+1")
         await db.commit()
-        cnt = (await q1("SELECT v FROM meta WHERE k='cnt'"))[0]
+        cnt = await get_counter()
+        log.info("Сообщение от %s, счётчик %s/%s", uid, cnt, RAFFLE_EVERY)
         if cnt >= RAFFLE_EVERY:
             await run_raffle(bot)
 
 
+@router.errors()
+async def on_error(event: ErrorEvent, bot: Bot):
+    log.error("Ошибка обработчика", exc_info=event.exception)
+    await notify_admin(bot, f"⚠️ Ошибка бота: <code>{esc(repr(event.exception))}</code>")
+    return True
+
+
+# ---------------- ЗАПУСК ----------------
 async def main():
     await init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    me = await bot.get_me()
+    log.info("Запущен @%s, версия %s, чат %s, розыгрыш каждые %s", me.username, VERSION, CHAT_ID, RAFFLE_EVERY)
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
+    await notify_admin(bot, f"✅ Бот запущен ({VERSION}). Розыгрыш каждые {RAFFLE_EVERY} сообщений.")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member"])
 
 
